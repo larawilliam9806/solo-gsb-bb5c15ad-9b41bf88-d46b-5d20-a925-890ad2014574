@@ -1113,3 +1113,126 @@ class IsotopeEnvelopeResponse(BaseModel):
     most_probable: IsotopePeak = Field(
         description="概率最高的峰；概率并列时取质量较小者"
     )
+
+
+# ------------------------------------------------------------ 元素分析反推分子式
+class FormulaElementMeasurement(BaseModel):
+    """一种元素（C/H/N/O）的实测质量百分比与绝对容差。"""
+
+    element: Literal["C", "H", "N", "O"] = Field(
+        ...,
+        description="元素符号，仅支持 C、H、N、O；请求中每种元素恰好一条记录",
+        examples=["C"],
+    )
+    percent: str = Field(
+        ...,
+        min_length=1,
+        description="该元素的实测质量百分比，**非负十进制字符串**，取值在 "
+        "0～100 之间（如 \"75.0\"、\"0\"、\"1e-2\"），不要传 JSON 数字；"
+        "四种元素的测量值不要求恰好合计 100",
+        examples=["75.0"],
+    )
+    tolerance: str = Field(
+        ...,
+        min_length=1,
+        description="该元素质量百分比的**绝对容差**（百分数），非负十进制"
+        "字符串，取值在 0～100 之间（如 \"0.5\"、\"0\"），匹配为闭区间"
+        "[percent−tolerance, percent+tolerance]，不要传 JSON 数字",
+        examples=["0.5"],
+    )
+
+    @field_validator("percent", "tolerance")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class MolarMassRange(BaseModel):
+    """名义摩尔质量的正整数闭区间（按 C=12/H=1/N=14/O=16 计算）。"""
+
+    minimum: int = Field(
+        ...,
+        ge=1,
+        description="摩尔质量闭区间下界（正整数，含端点）",
+        examples=[16],
+    )
+    maximum: int = Field(
+        ...,
+        ge=1,
+        description="摩尔质量闭区间上界（正整数，含端点，不得小于 minimum）",
+        examples=[20],
+    )
+
+    @field_validator("minimum", "maximum", mode="before")
+    @classmethod
+    def _reject_bool(cls, value: Any) -> Any:
+        # Pydantic v2 默认会把 JSON 布尔值当作 0/1 整数接受；必须在其整数
+        # 强转之前（mode=before）拦截，否则 isinstance(bool) 已无从识别
+        if isinstance(value, bool):
+            raise ValueError("摩尔质量必须是整数，不能是布尔值")
+        return value
+
+
+class FormulaInferRequest(BaseModel):
+    """``POST /formulas/infer`` 请求：C/H/N/O 实测质量百分比与摩尔质量区间。"""
+
+    elements: list[FormulaElementMeasurement] = Field(
+        ...,
+        min_length=4,
+        max_length=4,
+        description="C、H、N、O 四种元素各恰好一条测量记录（每条含实测质量"
+        "百分比 percent 与绝对容差 tolerance，均为 0～100 的十进制字符串），"
+        "不得缺失或重复；各测量值不要求合计 100",
+    )
+    molar_mass: MolarMassRange = Field(
+        ...,
+        description="名义摩尔质量的正整数闭区间 [minimum, maximum]"
+        "（均为含端点，按 C=12、H=1、N=14、O=16 计算）",
+    )
+
+
+class FormulaMassPercentBlock(BaseModel):
+    """一个候选分子式中四种元素各自的计算质量百分比（%，十进制字符串）。"""
+
+    C: str = Field(description="碳的计算质量百分比 100·12·n_C/M")
+    H: str = Field(description="氢的计算质量百分比 100·n_H/M")
+    N: str = Field(description="氮的计算质量百分比 100·14·n_N/M")
+    O: str = Field(description="氧的计算质量百分比 100·16·n_O/M")
+
+
+class FormulaMatch(BaseModel):
+    """一个落入全部百分比容差与摩尔质量区间的分子式。"""
+
+    formula: str = Field(
+        description="分子式（按 C/H/N/O 顺序渲染，计数为 0 的元素省略、为 1 省略下标）"
+    )
+    molar_mass: int = Field(description="名义摩尔质量 = 12·n_C + n_H + 14·n_N + 16·n_O")
+    counts: dict[str, int] = Field(
+        description="四种元素的原子计数（C/H/N/O 键齐全；总数大于零、逐项 0～30）"
+    )
+    mass_percent: FormulaMassPercentBlock = Field(
+        description="该分子式各项计算质量百分比（%）"
+    )
+    total_abs_deviation: str = Field(
+        description="总百分比绝对偏差 = Σ|计算百分比 − 实测百分比|"
+        "（精确有理数渲染的十进制字符串），第一排序键"
+    )
+
+
+class FormulaInferResponse(BaseModel):
+    elements: list[FormulaElementMeasurement] = Field(
+        description="客户端提交的四种元素测量记录（回显，与请求顺序一致）"
+    )
+    molar_mass: MolarMassRange = Field(description="摩尔质量闭区间（回显）")
+    count: int = Field(description="本次实际返回的匹配分子式数（≤ 20）")
+    total: int = Field(description="落入全部约束的匹配分子式总数（截断前）")
+    truncated: bool = Field(description="匹配总数超过 20、已截取前 20 个时为 true")
+    matches: list[FormulaMatch] = Field(
+        description="按总百分比绝对偏差、摩尔质量、C/H/N/O 计数依次升序排列的"
+        "前 20 个匹配分子式；无解时为空列表"
+    )

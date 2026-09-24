@@ -29,6 +29,12 @@ from .balancer import (
 from .blending import Stock, solve_blend
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
 from .equilibrium import solve_equilibrium
+from .formula_infer import (
+    ELEMENTS as FORMULA_ELEMENTS,
+    ElementMeasurement,
+    infer_formulas,
+    render_formula,
+)
 from .hess import HessError, KnownReaction, normalized_by_key, solve_hess
 from .isotopes import (
     MAX_ELEMENTS,
@@ -67,6 +73,7 @@ STATUS_CODES = {
     "INVALID_BLEND": 422,
     "NO_FEASIBLE_BLEND": 422,
     "INVALID_ISOTOPE": 422,
+    "INVALID_FORMULA_INFER": 422,
     "HESS_UNDERIVABLE": 422,
     "HESS_AMBIGUOUS": 422,
 }
@@ -1941,3 +1948,136 @@ def _solved_from_parts(
         coefficients=coefficients,
         elements=elements,
     )
+
+
+# ------------------------------------------------------------ 元素分析反推分子式
+def process_formula_infer(
+    element_items: list[dict[str, str]],
+    mass_min: int,
+    mass_max: int,
+) -> tuple[int, dict[str, Any]]:
+    """从 C/H/N/O 实测质量百分比反推分子式，返回 (http_status, payload)。
+
+    逐条解析四种元素的测量值与绝对容差（均为 0～100 的非负有限十进制
+    字符串，不要求合计为 100），并校验 C/H/N/O 各恰好一条、摩尔质量为
+    正整数闭区间；问题聚合为 422 INVALID_FORMULA_INFER（缺元素/重复
+    元素在 details.missing/duplicate 中给出）。校验通过后调用
+    :func:`app.formula_infer.infer_formulas` 以精确有理数同时筛选落入
+    全部百分比容差（闭区间）与质量区间的整数计数（逐项 0～30、总数
+    大于零），按总百分比绝对偏差、摩尔质量、C/H/N/O 计数依次升序返回
+    前 20 个。该接口为无状态计算，不读写幂等缓存。
+    """
+    # ---- 四种元素：一一对应（缺失/重复）+ 百分比与容差取值范围
+    seen: list[str] = []
+    duplicate_elements: list[str] = []
+    invalid_percent: list[dict[str, Any]] = []
+    invalid_tolerance: list[dict[str, Any]] = []
+    measurements: dict[str, ElementMeasurement] = {}
+
+    for item in element_items:
+        element = item["element"]
+        if element in seen:
+            duplicate_elements.append(element)
+        else:
+            seen.append(element)
+
+        percent_fraction = _parse_percent(item["percent"])
+        if percent_fraction is None:
+            invalid_percent.append(
+                {"element": element, "percent": item["percent"]}
+            )
+        tolerance_fraction = _parse_percent(item["tolerance"])
+        if tolerance_fraction is None:
+            invalid_tolerance.append(
+                {"element": element, "tolerance": item["tolerance"]}
+            )
+        if percent_fraction is not None and tolerance_fraction is not None:
+            measurements[element] = ElementMeasurement(
+                element=element,
+                percent=percent_fraction,
+                tolerance=tolerance_fraction,
+            )
+
+    missing_elements = sorted(set(FORMULA_ELEMENTS) - set(seen))
+
+    # ---- 摩尔质量闭区间
+    invalid_range = mass_min > mass_max
+
+    if (
+        duplicate_elements
+        or missing_elements
+        or invalid_percent
+        or invalid_tolerance
+        or invalid_range
+    ):
+        details: dict[str, Any] = {}
+        if missing_elements:
+            details["missing"] = missing_elements
+        if duplicate_elements:
+            details["duplicate"] = sorted(set(duplicate_elements))
+        if invalid_percent:
+            details["invalid_percent"] = invalid_percent
+        if invalid_tolerance:
+            details["invalid_tolerance"] = invalid_tolerance
+        if invalid_range:
+            details["invalid_molar_mass_range"] = {
+                "minimum": mass_min,
+                "maximum": mass_max,
+            }
+        return STATUS_CODES["INVALID_FORMULA_INFER"], {
+            "error": error_payload(
+                "INVALID_FORMULA_INFER",
+                "分子式反推请求必须合法：C、H、N、O 四种元素各恰好一条测量"
+                "记录（不能缺失或重复），实测百分比与绝对容差均必须是 0～100 "
+                "范围内的非负十进制字符串（不能为 JSON 数字、负数、NaN 或"
+                "无穷大），摩尔质量区间 minimum 不得大于 maximum",
+                details,
+            ),
+        }
+
+    candidates, total = infer_formulas(measurements, mass_min, mass_max)
+    matches = []
+    for candidate in candidates:
+        matches.append(
+            {
+                "formula": render_formula(
+                    candidate.c, candidate.h, candidate.n, candidate.o
+                ),
+                "molar_mass": candidate.molar_mass,
+                "counts": {
+                    "C": candidate.c,
+                    "H": candidate.h,
+                    "N": candidate.n,
+                    "O": candidate.o,
+                },
+                "mass_percent": {
+                    element: fraction_to_decimal_string(
+                        candidate.mass_percent[element]
+                    )
+                    for element in FORMULA_ELEMENTS
+                },
+                "total_abs_deviation": fraction_to_decimal_string(
+                    candidate.total_abs_deviation
+                ),
+            }
+        )
+
+    return 200, {
+        "elements": element_items,
+        "molar_mass": {"minimum": mass_min, "maximum": mass_max},
+        "count": len(matches),
+        "total": total,
+        "truncated": total > len(matches),
+        "matches": matches,
+    }
+
+
+def _parse_percent(text: str) -> Fraction | None:
+    """解析 0～100 的非负有限十进制字符串为精确 Fraction；非法返回 None。"""
+    try:
+        value = parse_moles(text)
+    except (ValueError, InvalidOperation):
+        return None
+    if value > 100:
+        return None
+    return decimal_to_fraction(value)

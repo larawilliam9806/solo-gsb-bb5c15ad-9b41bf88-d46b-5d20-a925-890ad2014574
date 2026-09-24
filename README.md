@@ -48,7 +48,14 @@
     精确有理二分求 Qc=Kc 的唯一内点（初始 Qc>Kc 时返回**负进度**），
     返回反应进度（绝对误差上界 1e-9 mol）、物料区间、初始/平衡反应商与
     各物种平衡摩尔数；
-14. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+14. `/formulas/infer` 做**元素分析反推分子式**：提交 C、H、N、O 四种
+    元素的实测质量百分比与绝对容差（均为 0～100 的十进制字符串，测量值
+    不要求合计 100）以及摩尔质量的正整数闭区间，按 C=12、H=1、N=14、
+    O=16 以精确有理数枚举逐元素原子数 0～30、总数大于零且**同时**落入
+    全部百分比容差（闭区间）与质量区间的整数计数，按总百分比绝对偏差、
+    摩尔质量、C/H/N/O 计数依次升序返回前 20 个分子式（含各项计算百分比、
+    匹配总数与截断标志），无解返回空列表；
+15. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -193,6 +200,24 @@ curl -X POST http://localhost:8000/api/v1/equilibrium/solve \
   }'
 ```
 
+元素分析反推分子式——葡萄糖元素分析结果（C 40.00%、H 6.71%、O
+53.29%，N 未检出，各自 ±0.05；测量值合计不必为 100），摩尔质量
+170～190：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/formulas/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "elements": [
+      {"element": "C", "percent": "40.00", "tolerance": "0.05"},
+      {"element": "H", "percent": "6.71",  "tolerance": "0.05"},
+      {"element": "N", "percent": "0",     "tolerance": "0.05"},
+      {"element": "O", "percent": "53.29", "tolerance": "0.05"}
+    ],
+    "molar_mass": {"minimum": 170, "maximum": 190}
+  }'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -205,7 +230,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素/赫斯定律）
+pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素/元素分析/赫斯定律）
 ```
 
 ---
@@ -226,6 +251,7 @@ pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素
 | POST | `/api/v1/isotopes/envelope` | 同位素名义质量峰分布：化学式 + 每元素同位素质量数/丰度 → 按质量升序的全部名义质量峰（最简分数概率）与最高概率峰 |
 | POST | `/api/v1/thermochemistry/hess` | 赫斯定律反应焓推导：目标反应 + 至多 6 条已知反应（含 kJ 反应焓）→ 各反应倍数（可反向/分数倍）、推导反应焓与合并抵消后的逐物种净系数 |
 | POST | `/api/v1/equilibrium/solve` | 理想溶液平衡组成：可逆反应 + 各参与物种正初始摩尔数 + 体积(L) 与 Kc → Qc=Kc 的唯一内点反应进度（初始 Qc>Kc 时为负进度）、物料区间与各物种平衡摩尔数（进度绝对误差上界 1e-9 mol） |
+| POST | `/api/v1/formulas/infer` | 元素分析反推分子式：C/H/N/O 实测质量百分比与绝对容差（十进制字符串，不要求合计 100）+ 摩尔质量正整数闭区间 → 同时落入全部容差与质量区间的前 20 个分子式（按总偏差、摩尔质量、计数升序）及匹配总数/截断标志 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -1268,7 +1294,107 @@ Kc=0.25 时 ξ=0、`direction="at_equilibrium"`。体积通过浓度项
 `reaction_id` 与 `/balance`、`/analyze` 及其它计量接口共享同一规范化
 签名；平衡求解本身不单独缓存，只复用配平缓存。
 
-### 2.13 幂等与查询
+### 2.13 元素分析反推分子式 `POST /api/v1/formulas/infer`
+
+提交 **C、H、N、O 四种元素各一条**元素分析测量记录（实测质量百分比
+`percent` 与绝对容差 `tolerance`，均为 **0～100 的十进制字符串**）与
+**名义摩尔质量的正整数闭区间** `molar_mass`，服务端按名义原子量
+**C=12、H=1、N=14、O=16** 枚举整数原子计数
+
+    n_C, n_H, n_N, n_O ∈ [0, 30]，  n_C + n_H + n_N + n_O > 0
+
+要求每个候选**同时**满足：
+
+* 摩尔质量（正整数，含端点）`minimum ≤ 12n_C + n_H + 14n_N + 16n_O ≤ maximum`；
+* 每种元素的计算质量百分比落入**闭**容差带：
+  `|100·a·n/M − percent| ≤ tolerance`（恰在边界上也算匹配）。
+
+四种元素的测量值**不要求恰好合计 100**（允许实验归一化误差）；各元素
+容差也是绝对值（百分数单位），不随其它元素缩放。全部输入先无损转为
+`Fraction`，热循环只做整数乘除与交叉相乘（不经过 `float`），因此
+恰落在容差边界上的候选不会被浮点误差误判。
+
+匹配结果排序键依次为：**总百分比绝对偏差**
+`Σ_e |计算百分比 − percent|`（精确有理数）、**摩尔质量**、**C/H/N/O
+计数**，全部升序；只返回前 **20** 个，并以 `total` 给出截断前的匹配
+总数、`truncated` 标识是否截取。**无任何匹配时返回 `200` 且
+`matches=[]`、`total=0`**（无解放到正常响应中，不作为错误）。
+
+请求体（`elements` 必须恰好 4 条，元素不得缺失或重复）：
+
+```json
+{
+  "elements": [
+    {"element": "C", "percent": "40.00", "tolerance": "0.05"},
+    {"element": "H", "percent": "6.71",  "tolerance": "0.05"},
+    {"element": "N", "percent": "0",     "tolerance": "0.05"},
+    {"element": "O", "percent": "53.29", "tolerance": "0.05"}
+  ],
+  "molar_mass": {"minimum": 170, "maximum": 190}
+}
+```
+
+上例唯一匹配葡萄糖 `C6H12O6`（M=180；计算百分比 C 40%、H 6.6̅%、
+O 53.3̅%，均落入容差），`200` 响应：
+
+```json
+{
+  "elements": [
+    {"element": "C", "percent": "40.00", "tolerance": "0.05"},
+    {"element": "H", "percent": "6.71",  "tolerance": "0.05"},
+    {"element": "N", "percent": "0",     "tolerance": "0.05"},
+    {"element": "O", "percent": "53.29", "tolerance": "0.05"}
+  ],
+  "molar_mass": {"minimum": 170, "maximum": 190},
+  "count": 1,
+  "total": 1,
+  "truncated": false,
+  "matches": [
+    {
+      "formula": "C6H12O6",
+      "molar_mass": 180,
+      "counts": {"C": 6, "H": 12, "N": 0, "O": 6},
+      "mass_percent": {
+        "C": "40",
+        "H": "6.666666666666666666666666667",
+        "N": "0",
+        "O": "53.33333333333333333333333333"
+      },
+      "total_abs_deviation": "0.08666666666666666666666666667"
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `elements` / `molar_mass` | 请求的测量记录与质量区间（原样回显，字符串保留客户端写法） |
+| `matches[].formula` | 分子式（C/H/N/O 顺序；计数 0 的元素省略、计数 1 省略下标） |
+| `matches[].counts` | 四种元素原子计数（四键齐全；逐项 0～30、合计大于零） |
+| `matches[].molar_mass` | 名义摩尔质量 = 12n_C + n_H + 14n_N + 16n_O（正整数） |
+| `matches[].mass_percent` | 各项**计算**质量百分比（%，十进制字符串；无限小数按 28 位有效数字银行家舍入） |
+| `matches[].total_abs_deviation` | 总百分比绝对偏差，第一排序键 |
+| `count` / `total` / `truncated` | 本次返回条数 / 截断前匹配总数 / 是否超过 20 已截取 |
+
+误差说明：`mass_percent` 等十进制字符串仅在输出时按 28 位有效数字
+舍入，匹配判定与排序都基于精确有理数；对同一请求重复调用得到完全
+一致的结果。
+
+错误响应：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 元素缺失（`details.missing`）或重复（`details.duplicate`） | `422 INVALID_FORMULA_INFER` |
+| `percent` / `tolerance` 超出 0～100、为负数、NaN、无穷或非数字字符串（`details.invalid_percent` / `invalid_tolerance` 附元素与原值） | `422 INVALID_FORMULA_INFER` |
+| `molar_mass.minimum > maximum`（`details.invalid_molar_mass_range`） | `422 INVALID_FORMULA_INFER` |
+| 请求体缺字段、`elements` 不是 4 条、元素符号非 C/H/N/O、百分比传成 JSON 数字、摩尔质量端点非正整数或为布尔值等结构问题 | `422 INVALID_REQUEST` |
+
+该接口为无状态计算（不读写幂等缓存，响应不含 `reaction_id`）；同一
+请求重复调用得到完全一致的结果。
+
+### 2.14 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -1340,7 +1466,7 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | --- | --- | --- |
 | `FORMULA_PARSE_ERROR` | 400 | 化学式无法解析（未知元素、括号不匹配、电荷非法等） |
 | `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种 |
-| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/yield` 投料或实际产量缺失/重复/含未知物种或任一侧摩尔数非法（实际产量侧问题在 `details.actual_yields.*`）；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤）；`/equilibrium/solve` 同一物种同时出现在反应两侧、初始量缺失/重复/含未知物种、初始摩尔数或体积/Kc 非正十进制字符串；`/inventory/allocate` 请求体结构问题（缺字段、空列表、日期格式错误、状态枚举非法、数字代替十进制字符串等） |
+| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/yield` 投料或实际产量缺失/重复/含未知物种或任一侧摩尔数非法（实际产量侧问题在 `details.actual_yields.*`）；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤）；`/equilibrium/solve` 同一物种同时出现在反应两侧、初始量缺失/重复/含未知物种、初始摩尔数或体积/Kc 非正十进制字符串；`/formulas/infer` 请求体结构问题（`elements` 不是 4 条、元素非 C/H/N/O、百分比/容差传成 JSON 数字或为空白、摩尔质量端点非正整数等）；`/inventory/allocate` 请求体结构问题（缺字段、空列表、日期格式错误、状态枚举非法、数字代替十进制字符串等） |
 | `IMPOSSIBLE_BALANCE` | 422 | 守恒方程组无解（含电荷无法守恒） |
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
@@ -1352,6 +1478,7 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | `INVALID_ISOTOPE` | 422 | `/isotopes/envelope` 同位素输入非法：元素组缺失/重复/多余/非法、质量数重复、丰度非法或精确之和不为 1、超过元素/原子数上限，问题明细在 `details` 中聚合返回 |
 | `HESS_UNDERIVABLE` | 422 | `/thermochemistry/hess` 目标反应不在已知反应计量向量的张成空间内（含目标独有物种，见 `details.target_only_species`），任何有符号/分数倍组合都无法复现目标反应 |
 | `HESS_AMBIGUOUS` | 422 | `/thermochemistry/hess` 存在多组线性组合可复现目标反应的计量向量，但按各组已知反应焓导出的目标反应焓不一致（已知数据不自洽） |
+| `INVALID_FORMULA_INFER` | 422 | `/formulas/infer` C/H/N/O 元素缺失/重复、实测百分比或绝对容差超出 0～100（含负数/NaN/非数字）或摩尔质量区间倒置，问题明细在 `details` 中聚合返回 |
 | `NOT_FOUND` | 404 | `reaction_id` 不在缓存中 |
 
 不唯一示例：`C + O2 -> CO + CO2` 缺少约束，返回
@@ -1380,11 +1507,12 @@ app/
   allocation.py     试剂批次 FEFO 领用分配：纯度换算有效物质、跨批拆分、过期/隔离跳过、未满足需求与汇总，Fraction 精确计算
   blending.py       溶液配制：目标溶质摩尔守恒 + 可用体积/终体积约束的精确线性规划（顶点枚举），母液总量最小、再按输入顺序字典序最小，Fraction 精确计算
   isotopes.py       同位素名义质量峰分布：逐元素多项分布枚举全部计数向量（不截断零概率组合）、同质量合并、跨元素卷积，Fraction 精确计算
+  formula_infer.py  元素分析反推分子式：C/H/N/O 计数 0～30 区间剪枝 + 容差闭区间整数交叉相乘枚举，按总偏差/摩尔质量/计数堆排前 20，Fraction 精确计算
   hess.py           赫斯定律反应焓推导：规范物种有符号计量向量、增广矩阵有理数 RREF 判定张成/歧义、有符号（反向/分数倍）组合求解，Fraction 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布、赫斯定律反应焓推导、理想溶液平衡组成测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布、元素分析反推分子式、赫斯定律反应焓推导、理想溶液平衡组成测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

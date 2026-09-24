@@ -34,6 +34,11 @@
   6 条已知反应（各含反应物、生成物、以 kJ 表示的反应焓），以精确有理
   数求已知反应计量向量的有符号（允许反向、分数倍）线性组合复现目标
   反应，返回各反应倍数、推导反应焓与合并抵消后的逐物种净系数；
+* ``POST /formulas/infer`` 元素分析反推分子式：C/H/N/O 四种元素的实测
+  质量百分比与绝对容差（0～100 十进制字符串，不要求合计 100）+ 摩尔
+  质量正整数闭区间，以精确有理数枚举逐项 0～30、总数大于零且同时落入
+  全部容差与质量区间的整数计数（C=12、H=1、N=14、O=16），按总百分比
+  绝对偏差、摩尔质量、C/H/N/O 计数依次升序返回前 20 个分子式；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -54,6 +59,8 @@ from .models import (
     BlendResponse,
     EquilibriumRequest,
     EquilibriumResponse,
+    FormulaInferRequest,
+    FormulaInferResponse,
     HessRequest,
     HessResponse,
     IsotopeEnvelopeRequest,
@@ -78,6 +85,7 @@ from .service import (
     process_balance,
     process_blend,
     process_equilibrium,
+    process_formula_infer,
     process_hess,
     process_isotope_envelope,
     process_reverse_plan,
@@ -118,7 +126,7 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
             "error": {
                 "code": "INVALID_REQUEST",
                 "message": "请求体校验失败：请检查必填字段、字段类型与取值范围"
-                "（摩尔数/纯度须为十进制字符串、日期须为 YYYY-MM-DD、"
+                "（摩尔数/纯度/百分比须为十进制字符串、日期须为 YYYY-MM-DD、"
                 "状态只能为 available 或 quarantined）",
                 "details": {"validation": _jsonable_errors(exc.errors())},
             }
@@ -353,6 +361,25 @@ async def thermochemistry_hess(request: HessRequest):
     status, payload = process_hess(
         request.target.model_dump(),
         [item.model_dump() for item in request.known_reactions],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/formulas/infer",
+    response_model=FormulaInferResponse,
+    tags=["元素分析"],
+    summary="由 C/H/N/O 实测质量百分比与摩尔质量区间反推分子式",
+    responses={
+        422: {"description": "元素缺失/重复、百分比或容差超出 0～100、"
+              "摩尔质量区间倒置或请求体结构非法"},
+    },
+)
+async def formulas_infer(request: FormulaInferRequest):
+    status, payload = process_formula_infer(
+        [item.model_dump() for item in request.elements],
+        request.molar_mass.minimum,
+        request.molar_mass.maximum,
     )
     return JSONResponse(status_code=status, content=payload)
 
