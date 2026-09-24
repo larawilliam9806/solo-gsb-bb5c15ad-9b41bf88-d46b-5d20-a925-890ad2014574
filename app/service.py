@@ -29,6 +29,12 @@ from .balancer import (
 from .blending import Stock, solve_blend
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
 from .equilibrium import solve_equilibrium
+from .formulas import (
+    ELEMENTS as FORMULA_ELEMENTS,
+    RESULT_LIMIT,
+    ElementMeasurement,
+    infer_formulas,
+)
 from .hess import HessError, KnownReaction, normalized_by_key, solve_hess
 from .isotopes import (
     MAX_ELEMENTS,
@@ -1941,3 +1947,140 @@ def _solved_from_parts(
         coefficients=coefficients,
         elements=elements,
     )
+
+
+# ------------------------------------------------------------ 分子式反演（CHNO）
+def process_formula_infer(
+    element_items: list[dict[str, Any]],
+    mass_min: int,
+    mass_max: int,
+) -> tuple[int, dict[str, Any]]:
+    """由 C/H/N/O 质量百分比实测值反推分子式，返回 (http_status, payload)。
+
+    校验四种元素恰好各一条记录（不能缺失、重复或给出 C/H/N/O 以外
+    的元素）、实测百分比与绝对容差均为 **0～100** 的有限十进制字符串
+    （容差非负；结构层已拒绝非字符串、空白与非正整数质量界），且
+    ``molar_mass_min ≤ molar_mass_max``——全部语义问题聚合为 422
+    INVALID_REQUEST。校验通过后调用 :func:`app.formulas.infer_formulas`
+    以精确有理数（整数交叉相乘）枚举 0～30 原子数、总数大于零且同时
+    落入全部百分比闭容差与摩尔质量闭区间的计数，按（总百分比绝对
+    偏差、摩尔质量、C/H/N/O 计数）升序取前 20 个；无候选时
+    ``formulas`` 为空列表。该接口为无状态计算，不读写幂等缓存。
+    """
+    seen: set[str] = set()
+    duplicate: list[str] = []
+    unexpected: list[str] = []
+    invalid_measurements: list[dict[str, str]] = []
+    invalid_tolerances: list[dict[str, str]] = []
+    parsed: dict[str, ElementMeasurement] = {}
+
+    for item in element_items:
+        element = item["element"]
+        if element in seen:
+            duplicate.append(element)
+        seen.add(element)
+        if element not in FORMULA_ELEMENTS:
+            unexpected.append(element)
+            continue
+
+        measurement_text = item["measurement"]
+        tolerance_text = item["tolerance"]
+        measurement: Decimal | None = None
+        tolerance: Decimal | None = None
+        try:
+            measurement = parse_moles(measurement_text)
+            if measurement > 100:
+                raise ValueError("实测百分比不能超过 100")
+        except (ValueError, InvalidOperation):
+            invalid_measurements.append(
+                {"element": element, "measurement": measurement_text}
+            )
+        try:
+            tolerance = parse_moles(tolerance_text)
+            if tolerance > 100:
+                raise ValueError("绝对容差不能超过 100")
+        except (ValueError, InvalidOperation):
+            invalid_tolerances.append(
+                {"element": element, "tolerance": tolerance_text}
+            )
+
+        if measurement is not None and tolerance is not None:
+            parsed[element] = ElementMeasurement(
+                element=element,
+                measurement=decimal_to_fraction(measurement),
+                tolerance=decimal_to_fraction(tolerance),
+            )
+
+    missing = [
+        element for element in FORMULA_ELEMENTS if element not in seen
+    ]
+    invalid_mass_range = mass_min > mass_max
+
+    if duplicate or unexpected or missing or invalid_measurements or \
+            invalid_tolerances or invalid_mass_range:
+        details: dict[str, Any] = {}
+        if missing:
+            details["missing_elements"] = missing
+        if duplicate:
+            details["duplicate_elements"] = sorted(set(duplicate))
+        if unexpected:
+            details["unexpected_elements"] = sorted(set(unexpected))
+        if invalid_measurements:
+            details["invalid_measurements"] = invalid_measurements
+        if invalid_tolerances:
+            details["invalid_tolerances"] = invalid_tolerances
+        if invalid_mass_range:
+            details["molar_mass_min"] = mass_min
+            details["molar_mass_max"] = mass_max
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "分子式反演请求必须合法：C、H、N、O 四种元素必须各恰好"
+                "给出一条实测记录（不能缺失、重复或给出其它元素）；"
+                "实测质量百分比与绝对容差必须是 0～100 的有限十进制字符串"
+                "（容差非负，不能为 JSON 数字）；摩尔质量区间为正整数"
+                "闭区间且下界不得大于上界",
+                details,
+            ),
+        }
+
+    # 元素记录按固定 C/H/N/O 顺序传给算法（实测值与容差同序）
+    measurements = [parsed[element] for element in FORMULA_ELEMENTS]
+    page, total = infer_formulas(measurements, mass_min, mass_max)
+    raw_by_element = {item["element"]: item for item in element_items}
+
+    return 200, {
+        "elements": [
+            {
+                "element": element,
+                "measurement": raw_by_element[element]["measurement"],
+                "tolerance": raw_by_element[element]["tolerance"],
+            }
+            for element in FORMULA_ELEMENTS
+        ],
+        "molar_mass_min": mass_min,
+        "molar_mass_max": mass_max,
+        "count": len(page),
+        "total_matches": total,
+        "truncated": total > RESULT_LIMIT,
+        "formulas": [
+            {
+                "formula": match.formula,
+                "counts": {
+                    element: match.counts[element]
+                    for element in FORMULA_ELEMENTS
+                },
+                "molar_mass": match.molar_mass,
+                "percentages": {
+                    element: fraction_to_decimal_string(
+                        match.percentages[element]
+                    )
+                    for element in FORMULA_ELEMENTS
+                },
+                "total_deviation": fraction_to_decimal_string(
+                    match.total_deviation
+                ),
+            }
+            for match in page
+        ],
+    }

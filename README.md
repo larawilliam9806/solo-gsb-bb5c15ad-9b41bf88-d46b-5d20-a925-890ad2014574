@@ -48,7 +48,14 @@
     精确有理二分求 Qc=Kc 的唯一内点（初始 Qc>Kc 时返回**负进度**），
     返回反应进度（绝对误差上界 1e-9 mol）、物料区间、初始/平衡反应商与
     各物种平衡摩尔数；
-14. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+14. `/formulas/infer` 做**分子式反演**：提交 C、H、N、O 四种元素的实测
+    质量百分比与绝对容差（十进制字符串，实测值不要求恰好合计 100）及
+    摩尔质量正整数闭区间，以精确有理数枚举逐元素原子数 0～30、总数大于
+    零且同时落入全部百分比容差与质量区间的计数（按 C=12、H=1、N=14、
+    O=16 计质量），按总百分比绝对偏差、摩尔质量、C/H/N/O 计数依次升序
+    返回前 20 个分子式、各项计算百分比、总匹配数与截断标志（无解返回
+    空列表）；
+15. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -193,6 +200,24 @@ curl -X POST http://localhost:8000/api/v1/equilibrium/solve \
   }'
 ```
 
+分子式反演——乙醇元素分析实测 C 52.14%、H 13.13%、O 34.73%（N 为 0），
+容差 0.5，摩尔质量 40～50：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/formulas/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "elements": [
+      {"element": "C", "measurement": "52.14", "tolerance": "0.5"},
+      {"element": "H", "measurement": "13.13", "tolerance": "0.5"},
+      {"element": "N", "measurement": "0",    "tolerance": "0"},
+      {"element": "O", "measurement": "34.73", "tolerance": "0.5"}
+    ],
+    "molar_mass_min": 40,
+    "molar_mass_max": 50
+  }'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -205,7 +230,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素/赫斯定律）
+pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素/赫斯定律/平衡组成/分子式反演）
 ```
 
 ---
@@ -226,6 +251,7 @@ pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素
 | POST | `/api/v1/isotopes/envelope` | 同位素名义质量峰分布：化学式 + 每元素同位素质量数/丰度 → 按质量升序的全部名义质量峰（最简分数概率）与最高概率峰 |
 | POST | `/api/v1/thermochemistry/hess` | 赫斯定律反应焓推导：目标反应 + 至多 6 条已知反应（含 kJ 反应焓）→ 各反应倍数（可反向/分数倍）、推导反应焓与合并抵消后的逐物种净系数 |
 | POST | `/api/v1/equilibrium/solve` | 理想溶液平衡组成：可逆反应 + 各参与物种正初始摩尔数 + 体积(L) 与 Kc → Qc=Kc 的唯一内点反应进度（初始 Qc>Kc 时为负进度）、物料区间与各物种平衡摩尔数（进度绝对误差上界 1e-9 mol） |
+| POST | `/api/v1/formulas/infer` | 分子式反演：C/H/N/O 实测质量百分比与绝对容差（十进制字符串）+ 摩尔质量正整数闭区间 → 按总偏差/摩尔质量/计数排序的前 20 个 CHNO 分子式、计算百分比、总匹配数与截断标志 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -1268,7 +1294,118 @@ Kc=0.25 时 ξ=0、`direction="at_equilibrium"`。体积通过浓度项
 `reaction_id` 与 `/balance`、`/analyze` 及其它计量接口共享同一规范化
 签名；平衡求解本身不单独缓存，只复用配平缓存。
 
-### 2.13 幂等与查询
+### 2.13 分子式反演 `POST /api/v1/formulas/infer`
+
+由**元素分析实测**反推**只含 C、H、N、O** 的分子式。客户端给出四种
+元素各一条实测记录（实测质量百分比 + 绝对容差，均为**十进制字符串**，
+百分数范围 0～100）以及摩尔质量的**正整数闭区间**
+`[molar_mass_min, molar_mass_max]`。服务按名义原子质量
+C=12、H=1、N=14、O=16 枚举逐元素原子数 **0～30**、总原子数大于零的
+计数 ``(c, h, n, o)``，计算
+
+    M = 12c + h + 14n + 16o
+    p_X = 100·w_X·k_X / M
+
+只保留同时满足
+
+    measurement_X − tolerance_X ≤ p_X ≤ measurement_X + tolerance_X（C/H/N/O 逐一起作用，闭区间含端点）
+    molar_mass_min ≤ M ≤ molar_mass_max（同样含端点）
+
+的计数。**实测值不要求恰好合计 100**（允许实验误差与未建模元素）。
+百分比与容差先无损转为精确有理数，筛选与排序比较全部改写为整数
+交叉相乘，不经过浮点；外层只遍历 (c, h, n) 三元组（≤31³ 组），由
+C/H/N 的百分比区间与质量区间把 M 夹成整数区间后扫描 o，即使全部
+92 万余个非零计数都命中也只保留前 20 名，最坏情形约 3 秒内返回。
+
+返回的候选按以下次序**依次升序**：
+
+1. **总百分比绝对偏差** `Σ|p_X − measurement_X|`（精确有理数，十进制字符串输出）；
+2. **摩尔质量** M（整数，同偏差的最简式倍数因此由小到大排列）；
+3. **(C, H, N, O) 计数元组**。
+
+取前 20 个，并用 `total_matches`（截取前的总候选数）与 `truncated`
+标识截断；无解时 `formulas=[]`、`count=0`、`truncated=false`。
+分子式按 Hill 顺序（C、H、N、O）渲染，原子数为 0 省略、为 1 省略
+下标（`"C2H6O"`、`"H2O"`、`"CH4"`）。该接口为无状态计算，不读写
+幂等缓存，响应不含 `reaction_id`。
+
+请求体字段约束：
+
+| 字段 | 约束 |
+| --- | --- |
+| `elements` | **恰好 4 条**，元素为 `"C"`/`"H"`/`"N"`/`"O"` 且各一条（不能缺失、重复或给出其它元素）；提交顺序任意，响应按 C/H/N/O 排序回显 |
+| `elements[].measurement` | 实测质量百分比，**0～100 的有限十进制字符串**（如 `"52.14"`，不接受 JSON 数字、负数或超过 100） |
+| `elements[].tolerance` | 绝对容差，**0～100 的非负十进制字符串**（如 `"0.5"`、`"0"`）；接受区间与 0～100 范围取交 |
+| `molar_mass_min` / `molar_mass_max` | 摩尔质量闭区间，**正整数**（≥ 1），且下界不得大于上界 |
+
+乙醇（C₂H₆O，M=46）实测 C 52.14%、H 13.13%、O 34.73%、N 0%，容差
+0.5，质量区间 40～50：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/formulas/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "elements": [
+      {"element": "C", "measurement": "52.14", "tolerance": "0.5"},
+      {"element": "H", "measurement": "13.13", "tolerance": "0.5"},
+      {"element": "N", "measurement": "0",    "tolerance": "0"},
+      {"element": "O", "measurement": "34.73", "tolerance": "0.5"}
+    ],
+    "molar_mass_min": 40,
+    "molar_mass_max": 50
+  }'
+```
+
+`200` 响应（十进制值均为字符串；计算百分比合计恰为 100）：
+
+```json
+{
+  "elements": [
+    {"element": "C", "measurement": "52.14", "tolerance": "0.5"},
+    {"element": "H", "measurement": "13.13", "tolerance": "0.5"},
+    {"element": "N", "measurement": "0",    "tolerance": "0"},
+    {"element": "O", "measurement": "34.73", "tolerance": "0.5"}
+  ],
+  "molar_mass_min": 40,
+  "molar_mass_max": 50,
+  "count": 1,
+  "total_matches": 1,
+  "truncated": false,
+  "formulas": [
+    {
+      "formula": "C2H6O",
+      "counts": {"C": 2, "H": 6, "N": 0, "O": 1},
+      "molar_mass": 46,
+      "percentages": {
+        "C": "52.17391304347826086956521739",
+        "H": "13.04347826086956521739130435",
+        "N": "0",
+        "O": "34.78260869565217391304347826"
+      },
+      "total_deviation": "0.1730434782608695652173913043"
+    }
+  ]
+}
+```
+
+去掉质量区间限制后，最简式的整数倍（C₄H₁₂O₂、C₆H₁₈O₃、…，在每种
+元素 ≤30 的范围内）因计算百分比相同而偏差相同，按**摩尔质量升序**
+先后返回；候选超过 20 个时 `truncated=true`，仅返回偏差最小的前 20
+个。容差为 `"0"` 时接受区间退化为精确等式，如以 `"37.5"/"12.5"/"0"/"50"`
+查询将精确命中 CH₄O 及其整数倍（计算百分比为有限小数时输出精确值，
+如 `"37.5"`；无限小数按 28 位有效数字银行家舍入，规则同其它计量接口）。
+
+错误响应（沿用统一结构化格式）：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 元素缺失、重复或给出 C/H/N/O 以外元素（`details.missing_elements` / `duplicate_elements` / `unexpected_elements`） | `422 INVALID_REQUEST` |
+| 实测值非法：负数、超过 100、NaN、Infinity、非数字字符串（`details.invalid_measurements`） | `422 INVALID_REQUEST` |
+| 容差非法：负数、超过 100、NaN、非数字字符串（`details.invalid_tolerances`） | `422 INVALID_REQUEST` |
+| 实测值或容差传成 JSON 数字、空白字符串、元素记录不为 4 条 | `422 INVALID_REQUEST` |
+| 质量界非正整数、为小数，或下界大于上界（后者在 `details.molar_mass_min/max` 回显） | `422 INVALID_REQUEST` |
+
+### 2.14 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -1340,7 +1477,7 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | --- | --- | --- |
 | `FORMULA_PARSE_ERROR` | 400 | 化学式无法解析（未知元素、括号不匹配、电荷非法等） |
 | `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种 |
-| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/yield` 投料或实际产量缺失/重复/含未知物种或任一侧摩尔数非法（实际产量侧问题在 `details.actual_yields.*`）；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤）；`/equilibrium/solve` 同一物种同时出现在反应两侧、初始量缺失/重复/含未知物种、初始摩尔数或体积/Kc 非正十进制字符串；`/inventory/allocate` 请求体结构问题（缺字段、空列表、日期格式错误、状态枚举非法、数字代替十进制字符串等） |
+| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字）；`/stoichiometry/plan` 目标重复、含非生成物物种或摩尔数非法；`/stoichiometry/yield` 投料或实际产量缺失/重复/含未知物种或任一侧摩尔数非法（实际产量侧问题在 `details.actual_yields.*`）；`/stoichiometry/sequence` 步骤为空、库存摩尔数非法（结构化错误的 `details.step` 另标出出错步骤）；`/equilibrium/solve` 同一物种同时出现在反应两侧、初始量缺失/重复/含未知物种、初始摩尔数或体积/Kc 非正十进制字符串；`/inventory/allocate` 请求体结构问题（缺字段、空列表、日期格式错误、状态枚举非法、数字代替十进制字符串等）；`/formulas/infer` C/H/N/O 元素缺失/重复/多余、实测值或容差不是 0～100 的十进制字符串（负数/NaN/JSON 数字等）、摩尔质量界非正整数或上下界颠倒 |
 | `IMPOSSIBLE_BALANCE` | 422 | 守恒方程组无解（含电荷无法守恒） |
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
@@ -1380,11 +1517,12 @@ app/
   allocation.py     试剂批次 FEFO 领用分配：纯度换算有效物质、跨批拆分、过期/隔离跳过、未满足需求与汇总，Fraction 精确计算
   blending.py       溶液配制：目标溶质摩尔守恒 + 可用体积/终体积约束的精确线性规划（顶点枚举），母液总量最小、再按输入顺序字典序最小，Fraction 精确计算
   isotopes.py       同位素名义质量峰分布：逐元素多项分布枚举全部计数向量（不截断零概率组合）、同质量合并、跨元素卷积，Fraction 精确计算
+  formulas.py       CHNO 分子式反演：百分比闭区间 + 摩尔质量闭区间收紧质量范围，整数交叉相乘筛选 0～30 原子计数并用 max 堆保留偏差最小的前 20 个候选，Fraction 精确计算
   hess.py           赫斯定律反应焓推导：规范物种有符号计量向量、增广矩阵有理数 RREF 判定张成/歧义、有符号（反向/分数倍）组合求解，Fraction 精确计算
   service.py        业务编排与响应组装
   models.py         Pydantic 请求/响应模型
   main.py           FastAPI 路由与异常处理
-tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布、赫斯定律反应焓推导、理想溶液平衡组成测试
+tests/              解析器、配平核心、HTTP API、批量计量、反向投料规划、实际收率、连续反应推演、试剂批次领用分配、溶液配制、同位素名义质量峰分布、赫斯定律反应焓推导、理想溶液平衡组成、CHNO 分子式反演测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

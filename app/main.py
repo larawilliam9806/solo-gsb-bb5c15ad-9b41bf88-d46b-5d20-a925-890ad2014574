@@ -34,6 +34,11 @@
   6 条已知反应（各含反应物、生成物、以 kJ 表示的反应焓），以精确有理
   数求已知反应计量向量的有符号（允许反向、分数倍）线性组合复现目标
   反应，返回各反应倍数、推导反应焓与合并抵消后的逐物种净系数；
+* ``POST /formulas/infer`` 分子式反演：给出 C、H、N、O 实测质量
+  百分比与绝对容差（十进制字符串）及摩尔质量正整数闭区间，以精确有理
+  数枚举 0～30 原子数、总数大于零且同时落入全部容差与质量区间的
+  计数，按总百分比绝对偏差、摩尔质量、C/H/N/O 计数升序返回前 20
+  个分子式与各项计算百分比（无解返回空列表）；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -54,6 +59,8 @@ from .models import (
     BlendResponse,
     EquilibriumRequest,
     EquilibriumResponse,
+    FormulaInferRequest,
+    FormulaInferResponse,
     HessRequest,
     HessResponse,
     IsotopeEnvelopeRequest,
@@ -78,6 +85,7 @@ from .service import (
     process_balance,
     process_blend,
     process_equilibrium,
+    process_formula_infer,
     process_hess,
     process_isotope_envelope,
     process_reverse_plan,
@@ -353,6 +361,25 @@ async def thermochemistry_hess(request: HessRequest):
     status, payload = process_hess(
         request.target.model_dump(),
         [item.model_dump() for item in request.known_reactions],
+    )
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/formulas/infer",
+    response_model=FormulaInferResponse,
+    tags=["分子式"],
+    summary="分子式反演：由 C/H/N/O 质量百分比实测值与摩尔质量区间反推分子式",
+    responses={
+        422: {"description": "输入非法（元素缺失/重复/多余、实测值或容差"
+              "不是 0～100 的十进制字符串、质量区间非正整数或上下界颠倒）"},
+    },
+)
+async def formulas_infer(request: FormulaInferRequest):
+    status, payload = process_formula_infer(
+        [item.model_dump() for item in request.elements],
+        request.molar_mass_min,
+        request.molar_mass_max,
     )
     return JSONResponse(status_code=status, content=payload)
 
